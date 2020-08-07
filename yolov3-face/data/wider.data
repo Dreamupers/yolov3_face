@@ -1,0 +1,4 @@
+classes=1
+train=../Dataset/wider_train.txt
+valid=../Dataset/wider_val.txt
+names=./data/face.names
