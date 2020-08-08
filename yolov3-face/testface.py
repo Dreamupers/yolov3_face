@@ -10,47 +10,35 @@ from utils.utils import *
 
 def test(cfg,
          data,
-         weights=None,
+         weights,
          batch_size=16,
          imgsz=416,
-         conf_thres=0.001,
+         conf_thres=0.3,
          iou_thres=0.6,  # for nms
-         save_json=False,
          single_cls=False,
          augment=False,
-         model=None,
-         dataloader=None,
          multi_label=True):
-    # Initialize/load model and set device
-    if model is None:
-        is_training = False
-        device = torch_utils.select_device(opt.device, batch_size=batch_size)
-        verbose = opt.task == 'test'
 
-        # Remove previous
-        for f in glob.glob('test_batch*.jpg'):
-            os.remove(f)
+    is_training = False
+    device = torch_utils.select_device(opt.device, batch_size=batch_size)
+    verbose = opt.task == 'test'
 
-        # Initialize model
-        model = Darknet(cfg, imgsz)
+    # Remove previous
+    for f in glob.glob('test_batch*.jpg'):
+        os.remove(f)
 
-        # Load weights
-        attempt_download(weights)
-        if weights.endswith('.pt'):  # pytorch format
-            model.load_state_dict(torch.load(weights, map_location=device)['model'])
-        else:  # darknet format
-            load_darknet_weights(model, weights)
+    # Initialize model
+    model = Darknet(cfg, imgsz)
 
-        # Fuse
-        model.fuse()
-        model.to(device)
+    # Load weights
+    if weights.endswith('.pt'):  # pytorch format
+        model.load_state_dict(torch.load(weights, map_location=device)['model'])
+    # Fuse
+    model.fuse()
+    model.to(device)
 
-        if device.type != 'cpu' and torch.cuda.device_count() > 1:
-            model = nn.DataParallel(model)
-    else:  # called by train.py
-        is_training = True
-        device = next(model.parameters()).device  # get model device
-        verbose = False
+    if device.type != 'cpu' and torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
 
     # Configure run
     data = parse_data_cfg(data)
@@ -61,15 +49,13 @@ def test(cfg,
     iouv = iouv[0].view(1)  # comment for mAP@0.5:0.95
     niou = iouv.numel()
 
-    # Dataloader
-    if dataloader is None:
-        dataset = LoadImagesAndLabels(path, imgsz, batch_size, rect=True, single_cls=opt.single_cls, pad=0.5)
-        batch_size = min(batch_size, len(dataset))
-        dataloader = DataLoader(dataset,
-                                batch_size=batch_size,
-                                num_workers=min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8]),
-                                pin_memory=True,
-                                collate_fn=dataset.collate_fn)
+    dataset = LoadImagesAndLabels(path, imgsz, batch_size, rect=True, single_cls=opt.single_cls, pad=0.5)
+    batch_size = min(batch_size, len(dataset))
+    dataloader = DataLoader(dataset,
+                            batch_size=batch_size,
+                            num_workers=min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8]),
+                            pin_memory=True,
+                            collate_fn=dataset.collate_fn)
 
     seen = 0
     model.eval()
@@ -113,26 +99,8 @@ def test(cfg,
                     stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
                 continue
 
-            # Append to text file
-            # with open('test.txt', 'a') as file:
-            #    [file.write('%11.5g' * 7 % tuple(x) + '\n') for x in pred]
-
-            # Clip boxes to image bounds
             clip_coords(pred, (height, width))
 
-            # Append to pycocotools JSON dictionary
-            if save_json:
-                # [{"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}, ...
-                image_id = int(Path(paths[si]).stem.split('_')[-1])
-                box = pred[:, :4].clone()  # xyxy
-                scale_coords(imgs[si].shape[1:], box, shapes[si][0], shapes[si][1])  # to original shape
-                box = xyxy2xywh(box)  # xywh
-                box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
-                for p, b in zip(pred.tolist(), box.tolist()):
-                    jdict.append({'image_id': image_id,
-                                  'category_id': coco91class[int(p[5])],
-                                  'bbox': [round(x, 3) for x in b],
-                                  'score': round(p[4], 5)})
 
             # Assign all predictions as incorrect
             correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=device)
@@ -197,31 +165,6 @@ def test(cfg,
         t = tuple(x / seen * 1E3 for x in (t0, t1, t0 + t1)) + (imgsz, imgsz, batch_size)  # tuple
         print('Speed: %.1f/%.1f/%.1f ms inference/NMS/total per %gx%g image at batch-size %g' % t)
 
-    # Save JSON
-    if save_json and map and len(jdict):
-        print('\nCOCO mAP with pycocotools...')
-        imgIds = [int(Path(x).stem.split('_')[-1]) for x in dataloader.dataset.img_files]
-        with open('results.json', 'w') as file:
-            json.dump(jdict, file)
-
-        try:
-            from pycocotools.coco import COCO
-            from pycocotools.cocoeval import COCOeval
-
-            # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
-            cocoGt = COCO(glob.glob('../coco/annotations/instances_val*.json')[0])  # initialize COCO ground truth api
-            cocoDt = cocoGt.loadRes('results.json')  # initialize COCO pred api
-
-            cocoEval = COCOeval(cocoGt, cocoDt, 'bbox')
-            cocoEval.params.imgIds = imgIds  # [:32]  # only evaluate these images
-            cocoEval.evaluate()
-            cocoEval.accumulate()
-            cocoEval.summarize()
-            # mf1, map = cocoEval.stats[:2]  # update to pycocotools results (mAP@0.5:0.95, mAP@0.5)
-        except:
-            print('WARNING: pycocotools must be installed with numpy==1.17 to run correctly. '
-                  'See https://github.com/cocodataset/cocoapi/issues/356')
-
     # Return results
     maps = np.zeros(nc) + map
     for i, c in enumerate(ap_class):
@@ -231,9 +174,9 @@ def test(cfg,
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='test.py')
-    parser.add_argument('--cfg', type=str, default='cfg/yolov3-spp.cfg', help='*.cfg path')
-    parser.add_argument('--data', type=str, default='data/coco2014.data', help='*.data path')
-    parser.add_argument('--weights', type=str, default='weights/yolov3-spp-ultralyticsz.pt', help='weights path')
+    parser.add_argument('--cfg', type=str, default='face_1.cfg', help='*.cfg path')
+    parser.add_argument('--data', type=str, default='wider.data', help='*.data path')
+    parser.add_argument('--weights', type=str, default='weights/yolov3-wider_16000.pt', help='weights path')
     parser.add_argument('--batch-size', type=int, default=16, help='size of each image batch')
     parser.add_argument('--img-size', type=int, default=512, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.001, help='object confidence threshold')
@@ -249,24 +192,12 @@ if __name__ == '__main__':
     opt.data = check_file(opt.data)  # check file
     print(opt)
 
-    # task = 'test', 'study', 'benchmark'
-    if opt.task == 'test':  # (default) test normally
-        test(opt.cfg,
-             opt.data,
-             opt.weights,
-             opt.batch_size,
-             opt.img_size,
-             opt.conf_thres,
-             opt.iou_thres,
-             opt.save_json,
-             opt.single_cls,
-             opt.augment)
-
-    elif opt.task == 'benchmark':  # mAPs at 256-640 at conf 0.5 and 0.7
-        y = []
-        for i in list(range(256, 640, 128)):  # img-size
-            for j in [0.6, 0.7]:  # iou-thres
-                t = time.time()
-                r = test(opt.cfg, opt.data, opt.weights, opt.batch_size, i, opt.conf_thres, j, opt.save_json)[0]
-                y.append(r + (time.time() - t,))
-        np.savetxt('benchmark.txt', y, fmt='%10.4g')  # y = np.loadtxt('study.txt')
+    test(opt.cfg,
+            opt.data,
+            opt.weights,
+            opt.batch_size,
+            opt.img_size,
+            opt.conf_thres,
+            opt.iou_thres,
+            opt.single_cls,
+            opt.augment)
